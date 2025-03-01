@@ -1,3 +1,26 @@
+- [1. What's BBR?](#1-whats-bbr)
+- [2.  **Network Path Model**](#2--network-path-model)
+  - [Key Parameters](#key-parameters)
+  - [Mathematical Formulas](#mathematical-formulas)
+  - [Control Mechanisms](#control-mechanisms)
+  - [State Machine](#state-machine)
+  - [Updating Estimates](#updating-estimates)
+  - [Handling Loss and Recovery](#handling-loss-and-recovery)
+  - [Restarting from Idle](#restarting-from-idle)
+- [2. Pacing Gain cycling](#2-pacing-gain-cycling)
+  - [Gain Cycling Details](#gain-cycling-details)
+  - [Gain Cycling Workflow](#gain-cycling-workflow)
+  - [Summary](#summary)
+- [3. Measurement](#3-measurement)
+    - [Measuring RTT](#measuring-rtt)
+    - [Measuring Delivery Rate](#measuring-delivery-rate)
+  - [Summary](#summary-1)
+- [4. RTT Sample](#4-rtt-sample)
+  - [Filtering Spurious RTT Samples](#filtering-spurious-rtt-samples)
+  - [Example Implementation](#example-implementation)
+  - [Summary](#summary-2)
+
+
 ## 1. What's BBR?
 
 BBR (Bottleneck Bandwidth and Round-trip propagation time) is a congestion control algorithm that builds an explicit model of the network path using recent measurements of a transport connection's delivery rate and round-trip time. 
