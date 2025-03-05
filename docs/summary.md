@@ -7,18 +7,36 @@
   - [Updating Estimates](#updating-estimates)
   - [Handling Loss and Recovery](#handling-loss-and-recovery)
   - [Restarting from Idle](#restarting-from-idle)
-- [2. Pacing Gain cycling](#2-pacing-gain-cycling)
-  - [Gain Cycling Details](#gain-cycling-details)
-  - [Gain Cycling Workflow](#gain-cycling-workflow)
+- [3. ProbeBW state cycling](#3-probebw-state-cycling)
+  - [3.1. ProbeBW\_DOWN](#31-probebw_down)
+  - [3.2. ProbeBW\_CRUISE](#32-probebw_cruise)
+  - [3.3. ProbeBW\_REFILL](#33-probebw_refill)
+  - [3.4. ProbeBW\_UP](#34-probebw_up)
   - [Summary](#summary)
-- [3. Measurement](#3-measurement)
+- [5. Understanding BBR's Rate and Inflght Flow Control Bounds](#5-understanding-bbrs-rate-and-inflght-flow-control-bounds)
+  - [Parameter Definitions](#parameter-definitions)
+  - [When to update](#when-to-update)
+  - [How These Parameters Affect BBR Behavior](#how-these-parameters-affect-bbr-behavior)
+- [5. Measurement](#5-measurement)
     - [Measuring RTT](#measuring-rtt)
     - [Measuring Delivery Rate](#measuring-delivery-rate)
   - [Summary](#summary-1)
-- [4. RTT Sample](#4-rtt-sample)
+- [6. RTT Sample](#6-rtt-sample)
   - [Filtering Spurious RTT Samples](#filtering-spurious-rtt-samples)
   - [Example Implementation](#example-implementation)
   - [Summary](#summary-2)
+- [7. protocol implementation considerations](#7-protocol-implementation-considerations)
+  - [Inputs Required by BBR from Transmission Protocol](#inputs-required-by-bbr-from-transmission-protocol)
+  - [Outputs from BBR to Transmission Protocol](#outputs-from-bbr-to-transmission-protocol)
+  - [Other Considerations](#other-considerations)
+- [8. Tracking Application-Limited Periods in BBR](#8-tracking-application-limited-periods-in-bbr)
+  - [Detecting Application-Limited vs. cwnd-Limited States](#detecting-application-limited-vs-cwnd-limited-states)
+    - [1. At Packet Transmission Time](#1-at-packet-transmission-time)
+    - [2. At ACK Reception Time](#2-at-ack-reception-time)
+  - [Key Implementation Details](#key-implementation-details)
+- [9. Simplified Bandwidth Probing Time Scale in BBR](#9-simplified-bandwidth-probing-time-scale-in-bbr)
+  - [Recommended Implementation](#recommended-implementation)
+  - [Parameter Guidelines](#parameter-guidelines)
 
 
 ## 1. What's BBR?
@@ -104,80 +122,108 @@ BBR interprets packet loss as a hint of potential changes in path behavior and a
 
 When restarting from idle, BBR paces packets at the estimated bottleneck bandwidth to quickly return to the target operating point. This helps in maintaining high throughput and low latency.
 
-## 2. Pacing Gain cycling
+## 3. ProbeBW state cycling
 
-Gain cycling is a mechanism used by BBR in the ProbeBW state to probe for available bandwidth and maintain a small, well-bounded queue. Here are more details about gain cycling and its workflow:
+The ProbeBW cycle transitions through four sequential states (DOWN→CRUISE→REFILL→UP) with varying durations. Here's a breakdown of each state's purpose and duration:
 
-### Gain Cycling Details
+### 3.1. ProbeBW_DOWN
+- **Purpose**: Deceleration tactic (pacing_gain = 0.9)
+- **Duration**: Variable
+- **Exit Conditions**:
+  - Inflight data is less than or equal to BBR.BDP (estimated bandwidth-delay product)
+  - AND there is sufficient headroom (inflight ≤ BBRHeadroom*BBR.inflight_hi)
+- **Transitions to**: ProbeBW_CRUISE
 
-1. **Purpose**:
-   - Gain cycling helps BBR flows reach high throughput, low queuing delay, and convergence to a fair share of bandwidth.
+### 3.2. ProbeBW_CRUISE
+- **Purpose**: Cruising tactic (pacing_gain = 1.0)
+- **Duration**: Adaptively determined
+- **Exit Conditions**: When it's time to probe for bandwidth, based on either:
+  - Wall clock time: T_bbr = 2-3 seconds (randomized)
+  - OR Round-trip count: T_reno = min(estimated_BDP, cwnd) round trips (capped at 62-63 round trips)
+- **Transitions to**: ProbeBW_REFILL
 
-2. **Phases**:
-   - BBR cycles through a sequence of pacing gain values in an eight-phase cycle:
-     - `[5/4, 3/4, 1, 1, 1, 1, 1, 1]`
-   - Each phase typically lasts for roughly one round-trip propagation time (`BBR.RTprop`).
+### 3.3. ProbeBW_REFILL
+- **Purpose**: Refill the pipe (pacing_gain = 1.0)
+- **Duration**: Exactly one packet-timed round trip
+- **Exit Condition**: One round trip has elapsed
+- **Transitions to**: ProbeBW_UP
 
-3. **Phases Explained**:
-   - **Phase 0 (5/4)**: Probes for more bandwidth by using a pacing gain of 5/4, which gradually raises the amount of data in flight.
-   - **Phase 1 (3/4)**: Drains any queue created in Phase 0 by using a pacing gain of 3/4, chosen to be the same distance below 1 as 5/4 is above 1.
-   - **Phases 2-7 (1)**: Cruises with a short queue and full utilization by using a pacing gain of 1.0.
+### 3.4. ProbeBW_UP
+- **Purpose**: Probe for bandwidth increases (pacing_gain = 1.25)
+- **Duration**: At least BBR.min_rtt, potentially longer
+- **Exit Conditions**: 
+  - At least BBR.min_rtt has elapsed AND inflight > 1.25 * BBR.bdp
+  - OR loss rate exceeds BBRLossThresh (2%)
+- **Transitions to**: ProbeBW_DOWN (completing the cycle)
 
-4. **Average Gain**:
-   - The average gain across all phases is 1.0, aiming for the average pacing rate to equal the estimated available bandwidth (`BBR.BtlBw`).
-
-### Gain Cycling Workflow
-
-1. **Initialization**:
-   - Upon entering the ProbeBW state, BBR (re)starts gain cycling:
-     ```plaintext
-     BBREnterProbeBW():
-       BBR.state = ProbeBW
-       BBR.pacing_gain = 1
-       BBR.cwnd_gain = 2
-       BBR.cycle_index = BBRGainCycleLen - 1 - random_int_in_range(0..6)
-       BBRAdvanceCyclePhase()
-     ```
-
-2. **Cycle Phase Check**:
-   - On each ACK, BBR checks if it's time to advance to the next gain cycle phase:
-     ```plaintext
-     BBRCheckCyclePhase():
-       if (BBR.state == ProbeBW and BBRIsNextCyclePhase())
-         BBRAdvanceCyclePhase()
-     ```
-
-3. **Advance Cycle Phase**:
-   - BBR advances to the next gain cycle phase:
-     ```plaintext
-     BBRAdvanceCyclePhase():
-       BBR.cycle_stamp = Now()
-       BBR.cycle_index = (BBR.cycle_index + 1) % BBRGainCycleLen
-       pacing_gain_cycle = [5/4, 3/4, 1, 1, 1, 1, 1, 1]
-       BBR.pacing_gain = pacing_gain_cycle[BBR.cycle_index]
-     ```
-
-4. **Cycle Phase Conditions**:
-   - BBR determines if it's time to advance to the next cycle phase:
-     ```plaintext
-     BBRIsNextCyclePhase():
-       is_full_length = (Now() - BBR.cycle_stamp) > BBR.RTprop
-       if (BBR.pacing_gain == 1)
-         return is_full_length
-       if (BBR.pacing_gain > 1)
-         return is_full_length and
-                   (packets_lost > 0 or
-                    prior_inflight >= BBRInflight(BBR.pacing_gain))
-       else  //  (BBR.pacing_gain < 1)
-         return is_full_length or
-                    prior_inflight <= BBRInflight(1)
-     ```
+The cycle then repeats, with most of the time typically spent in CRUISE state, making brief excursions to probe bandwidth (REFILL→UP) and drain any resulting queue (DOWN).
 
 ### Summary
 
 Gain cycling is a crucial part of BBR's ProbeBW state, allowing the algorithm to dynamically adjust its pacing rate to probe for available bandwidth and maintain optimal network performance. By cycling through different pacing gains, BBR can effectively balance high throughput and low queuing delay.
 
-## 3. Measurement
+## 5. Understanding BBR's Rate and Inflght Flow Control Bounds
+
+In BBR, four critical parameters work together to manage bandwidth utilization and in-flight data: `bw_hi`, `bw_lo`, `inflight_hi`, and `inflight_lo`. These parameters act as bounds that BBR uses to adapt to network conditions.
+
+### Parameter Definitions
+
+- **Long-term Model Parameters**
+  - **bw_hi**: Long-term maximum sending bandwidth that produces acceptable queue pressure
+  - **inflight_hi**: Long-term maximum volume of in-flight data that produces acceptable queue pressure
+
+- **Short-term Model Parameters**
+   - **bw_lo**: Short-term maximum sending bandwidth considered safe based on recent loss signals
+   - **inflight_lo**: Short-term maximum volume of in-flight data considered safe based on recent loss signals
+
+### When to update
+
+- **Upper Bounds (bw_hi, inflight_hi)**
+  1. **During ProbeBW_UP state**:
+     - `inflight_hi` increases gradually through `BBRProbeInflightHiUpward()`
+     - Starts cautiously, but increases more aggressively over time
+     - Growth doubles each round trip (1, 2, 4, 8, 16 packets, etc.)
+
+  2. **When loss is acceptable**:
+     - If `rs.tx_in_flight > BBR.inflight_hi`, then `BBR.inflight_hi = rs.tx_in_flight`
+     - If `rs.delivery_rate > BBR.bw_hi`, then `BBR.bw_hi = rs.delivery_rate`
+
+  3. **When loss is excessive**:
+     - If loss rate exceeds `BBRLossThresh` (2%), `inflight_hi` is reduced via `BBRHandleInflightTooHigh()`
+
+- **Lower Bounds (bw_lo, inflight_lo)**
+
+   1. **During loss events**:
+      - At the end of rounds with newly detected loss:
+      ```
+      bw_lo = max(bw_latest, BBRBeta * bw_lo)
+      inflight_lo = max(inflight_latest, BBRBeta * inflight_lo)
+      ```
+      - `BBRBeta` is 0.7 (similar to CUBIC's multiplicative decrease factor)
+
+   2. **During ProbeBW_REFILL**:
+      - Both `bw_lo` and `inflight_lo` are reset to "Infinity"
+      - This is the pivotal moment when BBR transitions from conservative short-term constraints to probing
+
+### How These Parameters Affect BBR Behavior
+
+Each BBR state uses these parameters differently to constrain bandwidth and in-flight data:
+
+| State          | Rate Constraints | Volume Constraints            |
+| -------------- | ---------------- | ----------------------------- |
+| Startup        | None             | None                          |
+| Drain          | bw_hi, bw_lo     | inflight_hi, inflight_lo      |
+| ProbeBW_DOWN   | bw_hi, bw_lo     | inflight_hi, inflight_lo      |
+| ProbeBW_CRUISE | bw_hi, bw_lo     | 0.85*inflight_hi, inflight_lo |
+| ProbeBW_REFILL | bw_hi            | inflight_hi                   |
+| ProbeBW_UP     | bw_hi            | inflight_hi                   |
+| ProbeRTT       | bw_hi, bw_lo     | 0.85*inflight_hi, inflight_lo |
+
+This dual-bound approach allows BBR to balance two goals:
+1. Quickly responding to short-term congestion (via low bounds)
+2. Efficiently probing for long-term available bandwidth (via high bounds)
+
+## 5. Measurement
 
 #### Measuring RTT
 
@@ -223,7 +269,7 @@ Accurate measurement of RTT and delivery rate is crucial for BBR to build an eff
 
 By following these guidelines, BBR can maintain accurate and reliable estimates of the network path characteristics, enabling it to achieve high throughput and low latency.
 
-## 4. RTT Sample
+## 6. RTT Sample
 
 guidelines for filter out spurious RTT samples caused by retransmissions or delayed ACKs:
 
@@ -278,3 +324,171 @@ BBRUpdateRTprop():
 ### Summary
 
 By following these guidelines and implementing the filtering logic, you can ensure that BBR maintains accurate and reliable RTT measurements, which are crucial for building an effective network path model. This helps BBR achieve high throughput and low latency by accurately estimating the propagation delay and avoiding spurious RTT samples caused by retransmissions or delayed ACKs.
+
+## 7. protocol implementation considerations
+
+To integrate BBR congestion control with a Sliding Window Transmission Protocol; here's what's needed:
+
+### Inputs Required by BBR from Transmission Protocol
+
+1. **Per-Packet Data**:
+   - `packet.departure_time`: Wall-clock time when each packet is sent
+   - `packet.size`: Size of each packet sent
+   - `packet.delivered`: Amount of data delivered when this packet was sent
+   - `packet.tx_in_flight`: Amount of data in flight when packet was sent
+   - Flag indicating if transmission was application-limited
+
+2. **Per-ACK Data**:
+   - Wall-clock time when ACK was received
+   - Which packet(s) were acknowledged
+   - `rs.newly_acked`: Bytes newly acknowledged by this ACK
+   - `rs.newly_lost`: Bytes newly marked as lost by this ACK
+   - `rs.delivery_rate`: Calculated delivery rate sample
+   - ACK arrival timestamps for RTT calculation
+
+3. **Connection State**:
+   - Current bytes in flight
+   - Whether connection is cwnd-limited or application-limited
+   - Initial congestion window size
+   - Sender Maximum Segment Size (SMSS)
+   - `C.delivered`: Total bytes delivered so far
+
+### Outputs from BBR to Transmission Protocol
+
+1. **Primary Control Parameters**:
+   - `BBR.pacing_rate`: The rate at which to send packets
+   - `cwnd`: Maximum volume of data allowed in flight
+   - `BBR.send_quantum`: Maximum burst size for transmission efficiency
+
+2. **Additional State Information**:
+   - `BBR.state`: Current state in BBR state machine
+   - `BBR.packet_conservation`: Whether BBR is in packet conservation mode
+   - `BBR.idle_restart`: Whether connection is restarting from idle
+
+### Other Considerations
+
+1. Need to implement a packet pacing mechanism if you don't already have one
+2. Implement the delivery rate calculation algorithm described in [draft-cheng-iccrg-delivery-rate-estimation]
+3. Add packet loss detection and RTT measurement capabilities
+4. Track application-limited periods properly to avoid misinterpreting application limits as network limits
+
+When correctly implemented, BBR will adjust these parameters based on network conditions to provide high throughput with low queuing delay.
+
+## 8. Tracking Application-Limited Periods in BBR
+
+Properly tracking application-limited periods is crucial for BBR to distinguish between network constraints and application constraints. Here's how to implement this:
+
+### Detecting Application-Limited vs. cwnd-Limited States
+
+#### 1. At Packet Transmission Time
+
+```c
+// Check if application-limited when sending a packet
+is_app_limited = (available_data_to_send < cwnd - bytes_in_flight)
+
+// If application-limited, mark the packet and record when it began
+if (is_app_limited) {
+    packet.is_app_limited = true;
+    if (!connection.app_limited) {
+        connection.app_limited = true;
+        connection.app_limited_start_delivered = connection.delivered;
+    }
+}
+```
+
+#### 2. At ACK Reception Time
+
+```c
+// When receiving ACKs for app-limited packets
+if (packet.is_app_limited) {
+    rs.is_app_limited = true;
+}
+
+// Check if we've exited app-limited state
+if (connection.app_limited && 
+    bytes_in_flight + available_data_to_send >= cwnd) {
+    connection.app_limited = false;
+    // Optional: track how much data was delivered during app-limited period
+    connection.app_limited_sample = connection.delivered - 
+                                  connection.app_limited_start_delivered;
+}
+```
+
+### Key Implementation Details
+
+1. **Accurate Measurement**: Track both:
+   - The number of bytes ready to send from the application
+   - The current available window (cwnd - bytes_in_flight)
+
+2. **State Transitions**:
+   - Enter app-limited state when available_data < available_window
+   - Exit app-limited state when available_data + bytes_in_flight ≥ cwnd
+
+3. **Proper Marking**: 
+   - Mark every packet sent during app-limited periods
+   - Mark every resulting delivery rate sample as app-limited
+   - Continue marking samples as app-limited until all packets sent during the app-limited period are acknowledged
+
+4. **Integration with BBR**: 
+   ```c
+   // When updating BBR.max_bw
+   BBRUpdateMaxBw() {
+     if (rs.delivery_rate >= BBR.max_bw || !rs.is_app_limited) {
+       BBR.max_bw = update_windowed_max_filter(...)
+     }
+   }
+   ```
+
+5. **Edge Cases**:
+   - Reset app-limited tracking after idle periods
+   - Handle reordering and packet loss appropriately
+   - Consider transitions between app-limited and non-app-limited periods
+
+This approach ensures BBR correctly distinguishes between network limitations and application constraints, preventing it from underestimating available bandwidth during periods when the application isn't fully utilizing the network path.
+
+## 9. Simplified Bandwidth Probing Time Scale in BBR
+
+If you don't need to coexist with legacy Reno/CUBIC flows, you can adopt a more aggressive and simplified bandwidth probing strategy in BBR. Here's how to modify the approach:
+
+1. **Remove the Dual-Time-Scale Mechanism**
+   - Eliminate the `T_reno` calculation entirely
+   - Use only the BBR-native time scale for probing frequency
+
+2. **Optimize the Probing Frequency**
+   ```c
+   // Instead of the complex T_probe calculation:
+   T_probe = T_bbr
+   
+   // Where T_bbr can be adjusted based on your needs:
+   T_bbr = uniformly_ranzation
+    next_probe_time = now + uniform_random(mdom_between(min_probe_interval, max_probe_interval)
+   ```
+
+3. **Consider These Factors When Setting Probe Intervals**:
+   - **Network RTT**: More frequent probing for low-RTT environments
+   - **Expected bandwidth variability**: More frequent probing for networks with frequently changing bandwidth
+   - **Application sensitivity**: Less frequent probing for latency-sensitive applications
+
+### Recommended Implementation
+
+```c
+BBRCheckTimeToProbeBW() {
+  // Simple time-based approach without Reno consideration
+  if (elapsed_time_since_last_probe >= T_bbr) {
+    BBRStartProbeBW_REFILL()
+    // Set next probe time with some randomiin_interval, max_interval)
+    return true
+  }
+  return false
+}
+```
+
+### Parameter Guidelines
+
+Without Reno/CUBIC coexistence concerns, you can adjust parameters to be more aggressive:
+
+- **Minimum interval**: 1-2 seconds (instead of 2-3 seconds)
+- **ProbeBW_UP pacing_gain**: Could be increased beyond 1.25 for faster bandwidth discovery
+- **Loss threshold**: Could be increased beyond 2% if your application tolerates higher loss
+
+This approach allows for more aggressive bandwidth discovery and adaptation, which can be beneficial in rapidly changing network environments where you control all endpoints.
