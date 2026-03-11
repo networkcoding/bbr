@@ -39,7 +39,7 @@ The target operating point is:
                    |     Measurement Layer        |
                    |  - delivery rate samples     |
                    |  - RTT samples               |
-                   |  - loss / ECN style signals  |
+                   |  - loss / ECN-style signals  |
                    +--------------+---------------+
                                   |
                                   v
