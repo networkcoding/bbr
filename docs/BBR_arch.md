@@ -93,7 +93,7 @@ In short, BBR is a closed-loop controller:
 
 - Quickly discovers available bandwidth.
 - Uses a high pacing gain to grow aggressively.
-- Tries to fill the pipe in `O(log2(BDP))` round trips.
+- Tries to fill the pipe in `O(log2(BDP / initial_cwnd))` round trips, i.e., a logarithmic (exponential-startup) number of RTTs relative to the initial inflight.
 - Exits when bandwidth growth stalls or loss indicates too much pressure.
 
 #### Drain
